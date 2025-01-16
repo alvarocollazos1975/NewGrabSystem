@@ -1,0 +1,1979 @@
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+
+namespace BIMOS
+{
+    [AddComponentMenu("BIMOS/Grabs/Grab")]
+    public abstract class Grab : MonoBehaviour
+    {
+        
+       
+         /// <summary>
+        /// Snap to a location or grab anywhere on the object
+        /// </summary>
+        [Tooltip("Snap to a location or grab anywhere on the object")]
+        public HandType GrabMechanic = HandType.Grip;
+        [Header("Grab Points")]
+        [Tooltip("Lista de puntos de agarre disponibles para este objeto.")]
+        public List<Transform> grabPoints = new List<Transform>();
+
+        [Header("Grab Settings")]
+        [Tooltip("Permitir agarre con la mano izquierda.")]
+        public bool IsLeftHanded = true;
+        [SerializeField] private float maxGrabDistance = 0.5f;
+
+        [Tooltip("Permitir agarre con la mano derecha.")]
+        public bool IsRightHanded = true;
+        public Grab[] EnableGrabs, DisableGrabs;
+
+         [HideInInspector]
+        public Hand LeftHand, RightHand;
+
+        public HandPose HandPose;
+        public delegate void Release();
+        public event Release ReleaseEvent;
+
+         private Rigidbody _rigidBody;
+        private ArticulationBody _articulationBody;
+        private Transform _body;
+
+        private List<Hand> grabbingHands = new List<Hand>(); // Manos que están agarrando el objeto
+        private Dictionary<Hand, ConfigurableJoint> handJoints = new Dictionary<Hand, ConfigurableJoint>(); // Joints creados por mano
+        private Dictionary<Hand, HandType> handTypes = new Dictionary<Hand, HandType>(); // Tipos de agarre por mano
+
+        [HideInInspector]
+        public Collider Collider;
+
+        [HideInInspector]
+        Vector3 grabPosition
+        {
+            get
+            {
+                if (primaryGrabOffset != null)
+                {
+                    return primaryGrabOffset.position;
+                }
+                else
+                {
+                    return transform.position;
+                }
+            }
+        }      
+
+         [HideInInspector]
+        public Vector3 GrabPositionOffset
+        {
+            get
+            {
+                if (primaryGrabOffset)
+                {
+                    return primaryGrabOffset.transform.localPosition;
+                }
+
+                return Vector3.zero;
+            }
+        }
+
+
+        [HideInInspector]
+        public Vector3 GrabRotationOffset
+        {
+            get
+            {
+                if (primaryGrabOffset)
+                {
+                    return primaryGrabOffset.transform.localEulerAngles;
+                }
+                return Vector3.zero;
+            }
+        }
+
+        protected Transform primaryGrabOffset;
+
+        [HideInInspector]
+        public Vector3 SecondaryLookOffset;
+
+        [HideInInspector]
+        public Transform SecondaryLookAtTransform;
+
+        [HideInInspector]
+        public Transform LocalOffsetTransform;
+        Transform getGrabPoint;
+
+        protected List<GrabHandler> heldByGrabbers = new List<GrabHandler>();
+
+        public List<GrabHandler> HeldByGrabbers
+        {
+            get
+            {
+                return heldByGrabbers;
+            }
+        }
+
+        [SerializeField] private List<Collider> colliders = new List<Collider>();
+
+        private void Awake()
+        {
+            // Si no se asignaron colliders, intenta encontrarlos automáticamente
+            if (colliders.Count == 0)
+            {
+                colliders.AddRange(GetComponentsInChildren<Collider>());
+            }
+
+            if (colliders.Count == 0)
+            {
+                Debug.LogError("No se encontraron colliders en el objeto. Por favor, asigne al menos uno.");
+            }
+        }
+
+        /// <summary>
+        /// Calcula la idoneidad de un agarre para una mano.
+        /// Este método puede ser sobrescrito en clases derivadas.
+        /// </summary>
+        /// <param name="handTransform">Transform de la mano que intenta agarrar.</param>
+        /// <returns>Puntuación del agarre (valores mayores indican mejor ajuste).</returns>
+        public virtual float CalculateRank(Transform handTransform)
+        {
+             if (Collider is MeshCollider)
+                return 1f / 1000f;
+
+            return 1f / Vector3.Distance(handTransform.position, Collider.ClosestPoint(handTransform.position));
+        }
+
+        /// <summary>
+        /// Alinea la mano al objeto agarrado.
+        /// Este método debe ser sobrescrito en clases derivadas para definir la lógica de alineación.
+        /// </summary>
+        /// <param name="hand">La mano que realiza el agarre.</param>
+        public virtual void AlignHand(Hand hand)
+        {
+            // Implementación base vacía.
+        }
+
+       /// <summary>
+/// Obtiene el punto de agarre más cercano compatible con la mano.
+/// </summary>
+/// <param name="hand">Instancia de la mano.</param>
+/// <returns>Transform del punto de agarre más cercano, o null si no se encuentra uno compatible.</returns>
+public virtual Transform GetClosestGrabPoint(Hand hand)
+{
+    Transform closestPoint = null;
+    float closestDistance = float.MaxValue;
+
+    foreach (Transform grabPoint in grabPoints)
+    {
+        if (grabPoint == null) continue;
+
+        GrabPoint grabPointComponent = grabPoint.GetComponent<GrabPoint>();
+
+        if (grabPointComponent != null || !grabPointComponent.enabled)
+        {
+            // Verifica si el punto de agarre es compatible con la mano.
+            bool isValidHand =
+                (hand.IsLeftHand && grabPointComponent.IsLeftHanded) ||
+                (!hand.IsLeftHand && grabPointComponent.IsRightHanded);
+
+            if (!isValidHand)
+                continue;
+
+            // Verifica si el punto de agarre está disponible.
+            if (grabPointComponent.CurrentHand != null)
+                continue;
+
+              // Verifica si el GrabPoint está disponible para la mano actual
+        if (!grabPointComponent.IsAvailableFor(hand))
+        {
+            continue;
+        }
+        }
+
+        // Calcula la distancia entre la mano y el punto de agarre.
+        float distance = Vector3.Distance(hand.PalmTransform.position, grabPoint.position);
+        if (distance < closestDistance)
+        {
+            closestDistance = distance;
+            closestPoint = grabPoint;
+
+            // Actualiza la pose de la mano asociada al punto de agarre más cercano.
+            HandPose = grabPointComponent?.HandPose;
+            
+            //Debug.Log($"Obteniendo grabpoint: {closestPoint}");
+        }
+    }
+
+    
+    return closestPoint;
+}
+
+        /// <summary>
+        /// Método que selecciona el punto de agarre según la mano y lógica personalizada.
+        /// </summary>
+        /// <param name="hand">La mano que intenta agarrar.</param>
+        /// <returns>El punto de agarre elegido.</returns>
+        public virtual Transform GetChosenGrab(Hand hand)
+        {
+            return GetClosestGrabPoint(hand); // Utiliza el punto más cercano por defecto.
+        }
+
+         public virtual Transform ActualizarprimaryGrabOffset(Transform transform)
+        {
+            return primaryGrabOffset=transform; // Utiliza el punto más cercano por defecto.
+        }
+
+
+
+
+        /// <summary>
+        /// Comprueba si el agarre es compatible con una mano dada.
+        /// </summary>
+        /// <param name="hand">La mano que intenta agarrar.</param>
+        /// <returns>True si el agarre es compatible, de lo contrario false.</returns>
+        public bool IsCompatibleWithHand(Hand hand)
+        {
+            if (hand.IsLeftHand && !IsLeftHanded)
+                return false;
+
+            if (!hand.IsLeftHand && !IsRightHanded)
+                return false;
+
+            return true;
+        }
+         private void OnEnable()
+        {
+            _body = Utilities.GetBody(transform, out _rigidBody, out _articulationBody);
+            if (!_body)
+            {
+                Rigidbody rigidbody = gameObject.AddComponent<Rigidbody>();
+                rigidbody.isKinematic = true;
+                _rigidBody = rigidbody;
+                _body = _rigidBody.transform;
+            }
+
+            Collider = GetComponent<Collider>();
+            if (Collider == null)
+            {
+                CreateCollider();
+            }
+
+            CreateGrabPoint();
+        }
+
+        /// <summary>
+        /// Returns the Grabber that first grabbed this item. Return null if not being held.
+        /// </summary>
+        /// <returns></returns>
+       public virtual GrabHandler GetPrimaryGrabber(Hand hand)
+        {
+            if (heldByGrabbers != null)
+            {
+                foreach (var grabber in heldByGrabbers)
+                {
+                    if (grabber != null && grabber._chosenGrab == this)
+                    {
+                        return grabber;
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        
+
+        /// <summary>
+        /// Método que se ejecuta cuando el objeto comienza a ser agarrado.
+        /// Este método puede ser sobrescrito en clases derivadas.
+        /// </summary>
+        /// <param name="hand">La mano que realiza el agarre.</param>
+       public virtual void OnGrab(Hand hand)
+        {
+            hand.CurrentGrab = this;
+
+            GrabHandler grabHandler = hand.GetComponent<GrabHandler>();
+            if (grabHandler && !heldByGrabbers.Contains(grabHandler))
+            {
+                heldByGrabbers.Add(grabHandler);
+            }
+
+            if (hand.IsLeftHand)
+                LeftHand = hand;
+            else
+                RightHand = hand;    
+
+                
+                 // Encuentra un GrabPoint válido
+            GrabPoint chosenGrabPoint = GetClosestGrabPoint(hand)?.GetComponent<GrabPoint>();
+
+           
+            if (chosenGrabPoint != null)
+            {
+                chosenGrabPoint.Occupy(hand);
+                hand.CurrentGrabPoint = chosenGrabPoint;
+            }
+                // Encuentra un GrabPoint válido
+    
+
+            // 1. Alinear el objeto a la mano (opcional para configuraciones iniciales)
+                //AlignObjectToHand(hand);
+
+                // 2. Alinear la mano al punto de agarre
+                if (GrabMechanic == HandType.Slider)
+                {
+                    StartCoroutine(AlignHandToGrabPointSmooth(hand)); // Usamos una transición más gradual
+                }
+                else
+                {
+                    StartCoroutine(AlignHandToGrabPoint(hand)); // Transición normal
+                }
+
+                // 3. Adjuntar la mano al punto de agarre
+                AttachHandToGrabPoint(hand);
+
+                // 4. Aplicar la pose específica del agarre
+                hand.GrabHandler.ApplyGrabPose(HandPose);
+
+                // 5. Realinear la mano para ajustes finales
+                AlignHand(hand);
+          
+
+            IgnoreCollision(hand, true);
+
+            foreach (Grab grab in EnableGrabs)
+            {
+                if (grab)
+                    grab.enabled = true;
+            }
+            foreach (Grab grab in DisableGrabs)
+            {
+                if (grab)
+                    grab.enabled = false;
+            }
+
+            // Deshabilitar los GrabPoints relacionados
+            foreach (GrabPoint relatedGrabPoint in chosenGrabPoint?.DisableGrabPoint ?? new GrabPoint[0])
+            {
+                relatedGrabPoint.enabled = false;
+            }
+
+
+            GetComponent<Interactable>()?.OnGrab();
+            Debug.Log($"{gameObject.name} ha sido agarrado por {hand.name}.");
+        }
+
+         public virtual void IgnoreCollision(Hand hand, bool ignore)
+        {
+            foreach (Collider collider in _body.GetComponentsInChildren<Collider>())
+            {
+                Physics.IgnoreCollision(collider, hand.PhysicsHandCollider, ignore);
+            }
+        }
+
+        
+
+        public void CreateGrabJoint(Hand hand, HandType grabMechanic)
+        {
+            // Evita crear múltiples joints para la misma mano
+            if (grabbingHands.Contains(hand))
+            {
+                Debug.LogWarning("Esta mano ya está agarrando el objeto.");
+                return;
+            }
+
+            // Crear un ConfigurableJoint
+            ConfigurableJoint joint = hand.PhysicsHandTransform.gameObject.AddComponent<ConfigurableJoint>();
+
+
+            // Configurar el cuerpo conectado
+            if (_rigidBody != null)
+                joint.connectedBody = _rigidBody;
+            if (_articulationBody != null)
+                joint.connectedArticulationBody = _articulationBody;
+
+
+                 if (GrabMechanic == HandType.Slider)
+                    {
+                        joint.autoConfigureConnectedAnchor = true;
+                        
+                    }
+                    if (GrabMechanic == HandType.Grip)
+                    {
+
+                         // Configuración general
+                        joint.autoConfigureConnectedAnchor = false;
+                        joint.anchor = Vector3.zero; // Punto en la mano
+                        joint.connectedAnchor = _body.InverseTransformPoint(primaryGrabOffset.position); // Offset relativo al objeto
+                        
+                    }
+
+
+
+           
+
+            // Configuración específica del tipo de agarre
+            switch (grabMechanic)
+            {
+                case HandType.Grip:
+                    joint.xMotion = ConfigurableJointMotion.Locked;
+                    joint.yMotion = ConfigurableJointMotion.Locked;
+                    joint.zMotion = ConfigurableJointMotion.Locked;
+                    joint.angularXMotion = ConfigurableJointMotion.Locked;
+                    joint.angularYMotion = ConfigurableJointMotion.Locked;
+                    joint.angularZMotion = ConfigurableJointMotion.Locked;
+                    break;
+
+                case HandType.Slider:
+                    joint.xMotion = ConfigurableJointMotion.Limited;
+                    joint.yMotion = ConfigurableJointMotion.Locked;
+                    joint.zMotion = ConfigurableJointMotion.Locked;
+
+                    // Limitar el movimiento en el eje X
+                    SoftJointLimit limit = new SoftJointLimit { limit = 0.1f }; // Ajustar el límite
+                    joint.linearLimit = limit;
+
+                    // Configuración adicional de rigidez y amortiguación
+                    joint.linearLimitSpring = new SoftJointLimitSpring
+                    {
+                        spring = 100f, // Rigidez
+                        damper = 10f   // Amortiguación
+                    };
+                    break;
+            }
+
+            // Registrar la mano y el joint
+            grabbingHands.Add(hand);
+            handJoints[hand] = joint;
+            handTypes[hand] = grabMechanic;
+
+            Debug.Log($"Joint creado para {grabMechanic}. Offset: {primaryGrabOffset.position}");
+        }
+
+        public void ReleaseGrabJoint(Hand hand)
+        {
+            // Si la mano no está agarrando, no hacer nada
+            if (!grabbingHands.Contains(hand))
+            {
+                Debug.LogWarning("Esta mano no está agarrando el objeto.");
+                return;
+            }
+
+            // Eliminar el joint correspondiente
+            if (handJoints.TryGetValue(hand, out ConfigurableJoint joint))
+            {
+                Destroy(joint);
+            }
+
+            // Limpiar las referencias
+            grabbingHands.Remove(hand);
+            handJoints.Remove(hand);
+            handTypes.Remove(hand);
+        }
+
+
+        /// <summary>
+        /// Método que se ejecuta cuando el objeto deja de ser agarrado.
+        /// Este método puede ser sobrescrito en clases derivadas.
+        /// </summary>
+        /// <param name="hand">La mano que suelta el objeto.</param>
+        /// <param name="toggleGrabs">Indica si se deben habilitar o deshabilitar otros GrabPoints asociados.</param>
+        public virtual void OnRelease(Hand hand, bool toggleGrabs)
+        {
+            if (hand == null)
+                return;
+
+            GrabHandler grabHandler = hand.GetComponent<GrabHandler>();
+            if (grabHandler && heldByGrabbers.Contains(grabHandler))
+            {
+                heldByGrabbers.Remove(grabHandler);
+            }
+
+            // Si la mano tiene un GrabPoint ocupado, libera ese punto
+            GrabPoint occupiedGrabPoint = hand.CurrentGrabPoint; // Asegúrate de que este campo esté configurado en Hand
+            if (occupiedGrabPoint != null)
+            {
+                occupiedGrabPoint.Release();
+                Debug.Log($"GrabPoint {occupiedGrabPoint.name} liberado por {hand.name}.");
+            }
+
+            PhysicsHand physicsHand = hand.GetComponent<PhysicsHand>();
+            if (physicsHand != null)
+            {
+                physicsHand.ResetOffsets();
+            }
+
+            DetachHandFromGrabPoint(hand);
+
+            // Libera cualquier joint o conexión
+            ReleaseGrabJoint(hand);
+
+            // Maneja el toggle de habilitación/deshabilitación de otros Grabs
+            if (toggleGrabs)
+            {
+                foreach (Grab grab in EnableGrabs)
+                {
+                    if (grab)
+                        grab.enabled = false;
+                }
+                foreach (Grab grab in DisableGrabs)
+                {
+                    if (grab)
+                        grab.enabled = true;
+                }
+            }
+
+            // Notifica a otros sistemas que el objeto ha sido liberado
+            GetComponent<Interactable>()?.OnRelease();
+
+            // Limpia la referencia actual de la mano
+            hand.CurrentGrab = null;
+
+            // Limpia la referencia a la mano en este objeto
+            if (hand.IsLeftHand)
+                LeftHand = null;
+            else
+                RightHand = null;
+
+            // Invoca eventos de liberación, si los hay
+            ReleaseEvent?.Invoke();
+
+            Debug.Log($"{gameObject.name} ha sido soltado por {hand.name}.");
+        }
+
+
+         public virtual void DestroyGrabJoint(Hand hand)
+        {
+            if (hand == null)
+                return;
+                 FixedJoint grabJoint = hand.PhysicsHandTransform.GetComponent<FixedJoint>();
+
+            if (GrabMechanic == HandType.Slider) {               
+                grabJoint.anchor = Vector3.zero;  
+            }
+
+            Destroy(grabJoint);           
+
+            IgnoreCollision(hand, false);
+        }
+
+       
+
+        private void OnDisable()
+        {
+            OnRelease(LeftHand, false);
+            OnRelease(RightHand, false);
+        }
+
+       private void AttachHandToGrabPoint(Hand hand)
+        {
+            hand.transform.SetParent(primaryGrabOffset); // Asignar al grab point
+            hand.transform.localPosition = Vector3.zero; // Sin offset de posición
+            hand.transform.localRotation = Quaternion.identity; // Sin offset de rotación
+        }
+
+        private IEnumerator AlignHandToGrabPoint(Hand hand)
+        {
+            // Alineación suave antes de fijar la posición
+            float duration = 0.1f; // Duración de la interpolación
+            float elapsed = 0f;
+
+            Vector3 startPosition = hand.transform.position;
+            Quaternion startRotation = hand.transform.rotation;
+
+            Vector3 targetPosition = primaryGrabOffset.position;
+            Quaternion targetRotation = primaryGrabOffset.rotation;
+
+            while (elapsed < duration)
+            {
+                elapsed += Time.deltaTime;
+                float t = elapsed / duration;
+
+                hand.transform.position = Vector3.Lerp(startPosition, targetPosition, t);
+                hand.transform.rotation = Quaternion.Slerp(startRotation, targetRotation, t);
+
+                yield return null;
+            }
+
+            // Asegurar alineación final
+            hand.transform.position = targetPosition;
+            hand.transform.rotation = targetRotation;
+            CreateGrabJoint(hand, HandType.Grip); // Para el grip
+
+          
+        }
+        private IEnumerator AlignHandToGrabPointSmooth(Hand hand)
+        {
+            Transform grabPoint = primaryGrabOffset; // Obtén el punto de agarre correspondiente
+            float duration = 0.2f; // Tiempo para completar la alineación
+            float elapsedTime = 0f;
+
+            Vector3 startPosition = hand.PalmTransform.position;
+            Quaternion startRotation = hand.PalmTransform.rotation;
+
+            while (elapsedTime < duration)
+            {
+                elapsedTime += Time.deltaTime;
+                float t = elapsedTime / duration;
+
+                // Movimiento y rotación suaves hacia el punto de agarre
+                hand.PalmTransform.position = Vector3.Lerp(startPosition, grabPoint.position, t);
+                hand.PalmTransform.rotation = Quaternion.Slerp(startRotation, grabPoint.rotation, t);
+
+                yield return null;
+            }
+
+            // Asegura que la mano esté exactamente en el punto final
+            hand.PalmTransform.position = grabPoint.position;
+            hand.PalmTransform.rotation = grabPoint.rotation;
+
+            CreateGrabJoint(hand, HandType.Slider); // Para el slider
+        }
+
+
+
+        private void DetachHandFromGrabPoint(Hand hand)
+        {
+            hand.transform.SetParent(null);
+        }
+
+        public virtual void CreateCollider()
+        {
+            SphereCollider collider = gameObject.AddComponent<SphereCollider>();
+            collider.isTrigger = true;
+            collider.radius = 0.01f;
+            Collider = collider;
+        }
+      
+          private void CreateGrabPoint()
+        {
+            if (primaryGrabOffset == null)
+            {
+                primaryGrabOffset = new GameObject("Primary Grab Point").transform;
+                primaryGrabOffset.SetParent(this.transform);
+                primaryGrabOffset.localPosition = Vector3.zero;
+            }
+
+        }
+
+       private void AlignObjectToHand(Hand hand)
+        {
+            if (primaryGrabOffset != null)
+            {
+                // Mover el objeto para alinear su posición con la mano
+                transform.position = hand.PhysicsHandTransform.position;
+
+                // Ajustar la rotación del objeto para que coincida con la mano
+                transform.rotation = hand.PhysicsHandTransform.rotation * Quaternion.Inverse(primaryGrabOffset.localRotation);
+            }
+        }
+
+
+
+        /// <summary>
+        /// Visualiza los puntos de agarre en el editor para facilitar ajustes.
+        /// </summary>
+        private void OnDrawGizmosSelected()
+        {
+            Gizmos.color = Color.green;
+
+            foreach (Transform grabPoint in grabPoints)
+            {
+                if (grabPoint != null)
+                {
+                    Gizmos.DrawWireSphere(grabPoint.position, 0.01f);
+                }
+            }
+
+             Gizmos.color = Color.red;
+
+            // Dibuja una esfera en la posición de primaryGrabOffset si existe
+            if (primaryGrabOffset != null)
+            {
+                Gizmos.DrawWireSphere(primaryGrabOffset.position, 0.02f);
+
+                // También puedes dibujar una línea desde el objeto al primaryGrabOffset para mayor claridad
+                Gizmos.DrawLine(transform.position, primaryGrabOffset.position);
+
+                // Opcional: Añadir un label (requiere usar Handles)
+                #if UNITY_EDITOR
+                UnityEditor.Handles.Label(primaryGrabOffset.position, "Primary Grab Offset");
+               
+                #endif
+            }          
+        }
+    }
+}
+public enum HandType
+{
+    Grip,
+    Slider
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+using UnityEngine;
+using System.Collections.Generic;
+
+namespace BIMOS
+{
+    [AddComponentMenu("BIMOS/Grabs/Grab (Basic)")]
+    public class Grab : MonoBehaviour
+    {
+        [HideInInspector]
+        public Hand LeftHand, RightHand;
+
+        public HandPose HandPose;
+        public delegate void Release();
+        public event Release ReleaseEvent;
+        public bool IsLeftHanded = true, IsRightHanded = true;
+        public Grab[] EnableGrabs, DisableGrabs;
+
+        public List<GrabPoint> grabPoints = new List<GrabPoint>();
+
+        private Rigidbody _rigidBody;
+        private ArticulationBody _articulationBody;
+        private Transform _body;
+
+        [HideInInspector]
+        public Collider Collider;
+
+        protected Transform primaryGrabOffset;
+                protected List<GrabHandler> heldByGrabbers = new List<GrabHandler>();
+
+        public List<GrabHandler> HeldByGrabbers
+        {
+            get
+            {
+                return heldByGrabbers;
+            }
+        }
+
+        private void OnEnable()
+        {
+            _body = Utilities.GetBody(transform, out _rigidBody, out _articulationBody);
+            if (!_body)
+            {
+                Rigidbody rigidbody = gameObject.AddComponent<Rigidbody>();
+                rigidbody.isKinematic = true;
+                _rigidBody = rigidbody;
+                _body = _rigidBody.transform;
+            }
+
+            Collider = GetComponent<Collider>();
+            if (Collider == null)
+            {
+                CreateCollider();
+            }
+
+            // Actualizar puntos de agarre
+            UpdateGrabPoints();
+        }
+
+        public virtual void CreateCollider()
+        {
+            SphereCollider collider = gameObject.AddComponent<SphereCollider>();
+            collider.isTrigger = true;
+            collider.radius = 0.01f;
+            Collider = collider;
+        }
+
+        public virtual void UpdateGrabPoints()
+        {
+            foreach (GrabPoint grabPoint in grabPoints)
+            {
+                grabPoint.primaryGrabOffset = grabPoint.transform;
+            }
+        }
+
+        public virtual Transform GetClosestGrabPoint(Transform handTransform)
+        {
+            Transform closestPoint = null;
+            float closestDistance = float.MaxValue;
+
+            foreach (GrabPoint grabPoint in grabPoints)
+            {
+                if ((handTransform.GetComponent<Hand>().IsLeftHand && grabPoint.IsLeftHanded) || (!handTransform.GetComponent<Hand>().IsLeftHand && grabPoint.IsRightHanded))
+                {
+                    float distance = Vector3.Distance(handTransform.position, grabPoint.transform.position);
+                    if (distance < closestDistance)
+                    {
+                        closestDistance = distance;
+                        closestPoint = grabPoint.transform;
+                    }
+                }
+            }
+
+            return closestPoint;
+        }
+
+        public virtual float CalculateRank(Transform handTransform)
+        {
+            if (Collider is MeshCollider)
+                return 1f / 1000f;
+
+            return 1f / Vector3.Distance(handTransform.position, Collider.ClosestPoint(handTransform.position));
+        }
+
+        public virtual void OnGrab(Hand hand)
+        {
+            hand.CurrentGrab = this;
+
+            GrabHandler grabHandler = hand.GetComponent<GrabHandler>();
+            if (grabHandler && !heldByGrabbers.Contains(grabHandler))
+            {
+                heldByGrabbers.Add(grabHandler);
+            }
+
+            Transform closestGrabPoint = GetClosestGrabPoint(hand.transform);
+            if (closestGrabPoint != null)
+            {
+                primaryGrabOffset = closestGrabPoint;
+
+                GrabPoint grabPoint = closestGrabPoint.GetComponent<GrabPoint>();
+                grabPoint.AssignHand(hand);
+
+                if (hand.IsLeftHand)
+                {
+                    LeftHand = hand;
+                    if (RightHand != null)
+                    {
+                        RightHand.enabled = false; // Deshabilitar la otra mano
+                    }
+                }
+                else
+                {
+                    RightHand = hand;
+                    if (LeftHand != null)
+                    {
+                        LeftHand.enabled = false; // Deshabilitar la otra mano
+                    }
+                }
+
+                AttachHandToGrabPoint(hand);
+                CreateGrabJoint(hand);
+                IgnoreCollision(hand, true);
+            }
+
+            GetComponent<Interactable>()?.OnGrab();
+        }
+
+        public virtual void OnRelease(Hand hand, bool toggleGrabs)
+        {
+            if (hand == null)
+                return;
+
+            GrabHandler grabHandler = hand.GetComponent<GrabHandler>();
+            if (grabHandler && heldByGrabbers.Contains(grabHandler))
+            {
+                heldByGrabbers.Remove(grabHandler);
+            }
+
+            DetachHandFromGrabPoint(hand);
+            DestroyGrabJoint(hand);
+            IgnoreCollision(hand, false);
+
+            GrabPoint grabPoint = primaryGrabOffset.GetComponent<GrabPoint>();
+            grabPoint.ReleaseHand(hand);
+
+            if (hand.IsLeftHand)
+            {
+                LeftHand = null;
+                if (RightHand != null)
+                {
+                    RightHand.enabled = true; // Habilitar la otra mano
+                }
+            }
+            else
+            {
+                RightHand = null;
+                if (LeftHand != null)
+                {
+                    LeftHand.enabled = true; // Habilitar la otra mano
+                }
+            }
+
+            GetComponent<Interactable>()?.OnRelease();
+
+            hand.CurrentGrab = null;
+
+            ReleaseEvent?.Invoke();
+        }
+
+        public virtual void IgnoreCollision(Hand hand, bool ignore)
+        {
+            foreach (Collider collider in _body.GetComponentsInChildren<Collider>())
+            {
+                Physics.IgnoreCollision(collider, hand.PhysicsHandCollider, ignore);
+            }
+        }
+
+        public virtual void AlignHand(Hand hand) { }
+
+        public virtual void DestroyGrabJoint(Hand hand)
+        {
+            if (hand == null)
+                return;
+
+            FixedJoint grabJoint = hand.PhysicsHandTransform.GetComponent<FixedJoint>();
+            grabJoint.anchor = Vector3.zero;
+            Destroy(grabJoint);
+        }
+
+        private void CreateGrabJoint(Hand hand)
+        {
+            FixedJoint grabJoint = hand.PhysicsHandTransform.gameObject.AddComponent<FixedJoint>();
+            grabJoint.autoConfigureConnectedAnchor = false;
+            grabJoint.anchor = Vector3.zero;
+
+            if (_rigidBody != null)
+                grabJoint.connectedBody = _rigidBody;
+            if (_articulationBody != null)
+                grabJoint.connectedArticulationBody = _articulationBody;
+
+            grabJoint.connectedAnchor = primaryGrabOffset.localPosition;
+        }
+
+        private void AttachHandToGrabPoint(Hand hand)
+        {
+            hand.transform.SetParent(primaryGrabOffset);
+            hand.transform.localPosition = Vector3.zero;
+            hand.transform.localRotation = Quaternion.identity;
+        }
+
+        private void DetachHandFromGrabPoint(Hand hand)
+        {
+            hand.transform.SetParent(null);
+        }
+
+        private void FixedUpdate()
+        {
+            // UpdateTwoHandedRotation();
+        }
+
+        private void UpdateTwoHandedRotation()
+        {
+            // Implementar la lógica de rotación a dos manos si es necesario
+        }
+
+        private void OnDisable()
+        {
+            OnRelease(null, false);
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+   public void CreateGrabJoint(GrabHandler grabHandler, HandType grabMechanic)
+    {
+        if (grabHandler == null || grabbingHands.Contains(grabHandler._hand))
+        {
+            Debug.LogWarning("El GrabHandler es nulo o la mano ya está agarrando el objeto.");
+            return;
+        }
+
+        Hand hand = grabHandler._hand;
+
+        // Crear un ConfigurableJoint
+        ConfigurableJoint joint = hand.PhysicsHandTransform.gameObject.AddComponent<ConfigurableJoint>();
+
+        // Configurar el cuerpo conectado
+        if (_rigidBody != null)
+            joint.connectedBody = _rigidBody;
+
+        // Configurar restricciones basadas en el GrabMechanic
+        if (grabMechanic == HandType.Slider)
+        {
+            joint.autoConfigureConnectedAnchor = false;
+            joint.anchor = Vector3.zero;
+            joint.connectedAnchor = _body.InverseTransformPoint(primaryGrabOffset.position);
+            //joint.connectedAnchor = _body.InverseTransformPoint(primaryGrabOffset.position);
+
+            // Permitir movimiento solo en el eje Z
+            joint.xMotion = ConfigurableJointMotion.Locked;
+            joint.yMotion = ConfigurableJointMotion.Locked;
+            joint.zMotion = ConfigurableJointMotion.Limited;
+            joint.angularXMotion = ConfigurableJointMotion.Locked;
+            joint.angularYMotion = ConfigurableJointMotion.Locked;
+            joint.angularZMotion = ConfigurableJointMotion.Locked;
+
+            // Configurar límites en el eje Z
+            SoftJointLimit zLimit = new SoftJointLimit
+            {
+                limit = 0.1f // Ajusta según el rango de movimiento permitido
+            };
+            joint.linearLimit = zLimit;
+
+            joint.angularXDrive = new JointDrive
+            {
+                positionSpring = 1000f,
+                positionDamper = 100f,
+                maximumForce = Mathf.Infinity
+            };
+            joint.angularYZDrive = joint.angularXDrive;
+            joint.slerpDrive = joint.angularXDrive;
+
+            // Bloquear todas las rotaciones
+            joint.angularXMotion = ConfigurableJointMotion.Locked;
+            joint.angularYMotion = ConfigurableJointMotion.Locked;
+            joint.angularZMotion = ConfigurableJointMotion.Locked;
+        }
+        else if (grabMechanic == HandType.Grip)
+        {
+            joint.autoConfigureConnectedAnchor = false;
+
+            // Bloquear todos los movimientos y rotaciones
+            joint.xMotion = ConfigurableJointMotion.Locked;
+            joint.yMotion = ConfigurableJointMotion.Locked;
+            joint.zMotion = ConfigurableJointMotion.Locked;
+            joint.angularXMotion = ConfigurableJointMotion.Locked;
+            joint.angularYMotion = ConfigurableJointMotion.Locked;
+            joint.angularZMotion = ConfigurableJointMotion.Locked;
+
+            // Ajustar el offset del punto de agarre
+            joint.anchor = Vector3.zero;
+            joint.connectedAnchor = _body.InverseTransformPoint(primaryGrabOffset.position);
+        }
+
+        // Registrar la mano y el joint
+        grabbingHands.Add(hand);
+        handJoints[hand] = joint;
+        handTypes[hand] = grabMechanic;
+
+        Debug.Log($"Joint creado para {grabMechanic}. Offset: {primaryGrabOffset.position}");
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+public virtual void OnRelease(GrabHandler grabHandler, bool toggleGrabs)
+        {
+              if (grabHandler == null)
+                    return;
+
+
+            if (handlerJoints.TryGetValue(grabHandler, out ConfigurableJoint joint))
+            {
+                Destroy(joint);
+            }
+
+             // Retirar el GrabHandler de la lista
+        if (grabbingHandlers.Contains(grabHandler))
+        {
+            grabbingHandlers.Remove(grabHandler);
+            Debug.Log($"GrabHandler {grabHandler.name} eliminado de grabbingHandlers.");
+        }
+
+
+            //grabbingHandlers.Remove(grabHandler);
+            handlerJoints.Remove(grabHandler);
+            handlerTypes.Remove(grabHandler);
+
+              // Si la mano tiene un GrabPoint ocupado, libera ese punto
+            GrabPoint occupiedGrabPoint = grabHandler._hand.CurrentGrabPoint; // Asegúrate de que este campo esté configurado en Hand
+            if (occupiedGrabPoint != null)
+            {
+                occupiedGrabPoint.Release();
+                Debug.Log($"GrabPoint {occupiedGrabPoint.name} liberado por {grabHandler.name}.");
+            }
+
+            PhysicsHand physicsHand = grabHandler._hand.GetComponent<PhysicsHand>();
+            if (physicsHand != null)
+            {
+                physicsHand.ResetOffsets();
+            }
+
+            DetachHandFromGrabPoint(grabHandler);
+           // ReleaseGrabJoint(hand);
+
+            if (toggleGrabs)
+            {
+                foreach (Grab grab in EnableGrabs)
+                {
+                    if (grab)
+                        grab.enabled = false;
+                }
+                foreach (Grab grab in DisableGrabs)
+                {
+                    if (grab)
+                        grab.enabled = true;
+                }
+            }
+
+             // Restaurar la rotación inicial de la mano
+            grabHandler._hand.PalmTransform.rotation = grabHandler._hand.PhysicsHandTransform.rotation;          
+
+            GetComponent<Interactable>()?.OnRelease();
+            grabHandler._hand.CurrentGrab = null;
+            grabHandler._hand.CurrentGrabPoint?.Release();
+            grabHandler._hand.CurrentGrabPoint = null;
+
+            Debug.Log($"{gameObject.name} ha sido soltado por {grabHandler.name}.");
+        }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+
+namespace BIMOS
+{
+    [AddComponentMenu("BIMOS/Grabs/Grab")]
+    public abstract class Grab : MonoBehaviour
+    {
+        
+       
+         /// <summary>
+        /// Snap to a location or grab anywhere on the object
+        /// </summary>
+        [Tooltip("Snap to a location or grab anywhere on the object")]
+        public HandType GrabMechanic = HandType.Grip;
+        [Header("Grab Points")]
+        [Tooltip("Lista de puntos de agarre disponibles para este objeto.")]
+        public List<Transform> grabPoints = new List<Transform>();
+
+        [Header("Grab Settings")]
+        [Tooltip("Permitir agarre con la mano izquierda.")]
+        public bool IsLeftHanded = true;
+        [SerializeField] private float maxGrabDistance = 0.5f;
+
+        [Tooltip("Permitir agarre con la mano derecha.")]
+        public bool IsRightHanded = true;
+        public Grab[] EnableGrabs, DisableGrabs;
+
+         [HideInInspector]
+        public Hand LeftHand, RightHand;
+
+        public HandPose HandPose;
+        public delegate void Release();
+        public event Release ReleaseEvent;
+
+         private Rigidbody _rigidBody;
+        private ArticulationBody _articulationBody;
+        private Transform _body;
+
+        private List<GrabHandler> grabbingHandlers = new List<GrabHandler>(); // GrabHandlers que están agarrando el objeto
+        private Dictionary<GrabHandler, ConfigurableJoint> handlerJoints = new Dictionary<GrabHandler, ConfigurableJoint>(); // Joints creados por GrabHandler
+        private Dictionary<GrabHandler, HandType> handlerTypes = new Dictionary<GrabHandler, HandType>(); // Tipos de agarre por GrabHandler
+
+
+        [HideInInspector]
+        public Collider Collider;
+
+        [HideInInspector]
+        Vector3 grabPosition
+        {
+            get
+            {
+                if (primaryGrabOffset != null)
+                {
+                    return primaryGrabOffset.position;
+                }
+                else
+                {
+                    return transform.position;
+                }
+            }
+        }      
+
+         [HideInInspector]
+        public Vector3 GrabPositionOffset
+        {
+            get
+            {
+                if (primaryGrabOffset)
+                {
+                    return primaryGrabOffset.transform.localPosition;
+                }
+
+                return Vector3.zero;
+            }
+        }
+
+
+        [HideInInspector]
+        public Vector3 GrabRotationOffset
+        {
+            get
+            {
+                if (primaryGrabOffset)
+                {
+                    return primaryGrabOffset.transform.localEulerAngles;
+                }
+                return Vector3.zero;
+            }
+        }
+
+        protected Transform primaryGrabOffset;
+
+        [HideInInspector]
+        public Vector3 SecondaryLookOffset;
+
+        [HideInInspector]
+        public Transform SecondaryLookAtTransform;
+
+        [HideInInspector]
+        public Transform LocalOffsetTransform;
+        Transform getGrabPoint;
+
+        protected List<GrabHandler> heldByGrabbers = new List<GrabHandler>();
+
+        public List<GrabHandler> HeldByGrabbers
+        {
+            get
+            {
+                return heldByGrabbers;
+            }
+        }
+
+        [SerializeField] private List<Collider> colliders = new List<Collider>();
+
+        private void Awake()
+        {
+            // Si no se asignaron colliders, intenta encontrarlos automáticamente
+            if (colliders.Count == 0)
+            {
+                colliders.AddRange(GetComponentsInChildren<Collider>());
+            }
+
+            if (colliders.Count == 0)
+            {
+                Debug.LogError("No se encontraron colliders en el objeto. Por favor, asigne al menos uno.");
+            }
+        }
+
+       private void LateUpdate()
+        {
+            // Si no hay handlers agarrando, salir
+            if (grabbingHandlers.Count == 0) return;
+
+            foreach (var handler in grabbingHandlers)
+            {
+                if (!handlerJoints.TryGetValue(handler, out ConfigurableJoint joint)) continue;
+
+                // Si el tipo de agarre es un slider, actualiza la posición y rotación
+                if (handlerTypes[handler] == HandType.Slider)
+                {
+                    joint.connectedAnchor = _body.InverseTransformPoint(primaryGrabOffset.position);
+
+                    // Sincronizar rotación (opcional, según tus necesidades)
+                    Quaternion targetRotation = Quaternion.Inverse(_rigidBody.transform.rotation) * handler._hand.PhysicsHandTransform.rotation;
+                    joint.targetRotation = targetRotation;
+
+                    Debug.Log($"Actualizando slider para {handler.name}. ConnectedAnchor: {joint.connectedAnchor}");
+                }
+            }
+
+            //  foreach (var hand in grabbingHandlers)
+            // {
+            //     if (handlerTypes[hand] == HandType.Slider)
+            //     {
+            //          SyncHandRotationWithSlider(hand);
+
+            //     }
+               
+            // }
+        }
+
+        private void SyncHandRotationWithSlider(GrabHandler grabHandler)
+        {
+            if (grabHandler == null || grabHandler._hand.CurrentGrab == null) return;
+
+            
+
+            // Asegurarse de que la mano siga la rotación del slider
+            grabHandler._hand.PalmTransform.rotation = primaryGrabOffset.rotation;
+        }
+
+
+
+
+        /// <summary>
+        /// Calcula la idoneidad de un agarre para una mano.
+        /// Este método puede ser sobrescrito en clases derivadas.
+        /// </summary>
+        /// <param name="handTransform">Transform de la mano que intenta agarrar.</param>
+        /// <returns>Puntuación del agarre (valores mayores indican mejor ajuste).</returns>
+        public virtual float CalculateRank(Transform handTransform)
+        {
+             if (Collider is MeshCollider)
+                return 1f / 1000f;
+
+            return 1f / Vector3.Distance(handTransform.position, Collider.ClosestPoint(handTransform.position));
+        }
+
+        /// <summary>
+        /// Alinea la mano al objeto agarrado.
+        /// Este método debe ser sobrescrito en clases derivadas para definir la lógica de alineación.
+        /// </summary>
+        /// <param name="hand">La mano que realiza el agarre.</param>
+        public virtual void AlignHand(Hand hand)
+        {
+            // Implementación base vacía.
+        }
+
+/// <summary>
+/// Obtiene el punto de agarre más cercano compatible con la mano controlada por el GrabHandler.
+/// </summary>
+/// <param name="grabHandler">Instancia del GrabHandler asociado a la mano.</param>
+/// <returns>Transform del punto de agarre más cercano, o null si no se encuentra uno compatible.</returns>
+public virtual Transform GetClosestGrabPoint(GrabHandler grabHandler)
+{
+    if (grabHandler == null || grabHandler._hand == null)
+    {
+        Debug.LogWarning("GrabHandler o su Hand asociada son nulos.");
+        return null;
+    }
+
+    Hand hand = grabHandler._hand; // Obtiene la mano asociada al GrabHandler
+    Transform closestPoint = null;
+    float closestDistance = float.MaxValue;
+
+    foreach (Transform grabPoint in grabPoints)
+    {
+        if (grabPoint == null) 
+            continue;
+
+        GrabPoint grabPointComponent = grabPoint.GetComponent<GrabPoint>();
+
+        if (grabPointComponent == null || !grabPointComponent.enabled)
+        {
+            continue;
+        }
+
+        // Verifica si el punto de agarre es compatible con la mano
+        if (!grabPointComponent.IsAvailableFor(hand))
+        {
+            continue;
+        }
+
+        // Verifica si el GrabPoint ya está ocupado por otro GrabHandler
+        if (grabPointComponent.CurrentHand != null && grabPointComponent.CurrentHand.GrabHandler != grabHandler)
+        {
+            continue;
+        }
+
+        // Calcula la distancia entre la mano y el punto de agarre
+        float distance = Vector3.Distance(hand.PalmTransform.position, grabPoint.position);
+
+        if (distance < closestDistance)
+        {
+            closestDistance = distance;
+            closestPoint = grabPoint;
+
+            // Actualiza la pose de la mano asociada al punto de agarre más cercano
+            HandPose = grabPointComponent.HandPose;
+        }
+    }
+
+    return closestPoint;
+}
+
+
+        /// <summary>
+        /// Método que selecciona el punto de agarre según la mano y lógica personalizada.
+        /// </summary>
+        /// <param name="hand">La mano que intenta agarrar.</param>
+        /// <returns>El punto de agarre elegido.</returns>
+        public virtual Transform GetChosenGrab(GrabHandler hand)
+        {
+            return GetClosestGrabPoint(hand); // Utiliza el punto más cercano por defecto.
+        }
+
+         public virtual Transform ActualizarprimaryGrabOffset(Transform transform)
+        {
+            return primaryGrabOffset=transform; // Utiliza el punto más cercano por defecto.
+        }
+
+
+
+
+        /// <summary>
+        /// Comprueba si el agarre es compatible con una mano dada.
+        /// </summary>
+        /// <param name="hand">La mano que intenta agarrar.</param>
+        /// <returns>True si el agarre es compatible, de lo contrario false.</returns>
+        public bool IsCompatibleWithHand(Hand hand)
+        {
+            if (hand.IsLeftHand && !IsLeftHanded)
+                return false;
+
+            if (!hand.IsLeftHand && !IsRightHanded)
+                return false;
+
+            return true;
+        }
+         private void OnEnable()
+        {
+            _body = Utilities.GetBody(transform, out _rigidBody, out _articulationBody);
+            if (!_body)
+            {
+                Rigidbody rigidbody = gameObject.AddComponent<Rigidbody>();
+                rigidbody.isKinematic = true;
+                _rigidBody = rigidbody;
+                _body = _rigidBody.transform;
+            }
+
+            Collider = GetComponent<Collider>();
+            if (Collider == null)
+            {
+                CreateCollider();
+            }
+
+            CreateGrabPoint();
+        }
+
+        /// <summary>
+        /// Returns the Grabber that first grabbed this item. Return null if not being held.
+        /// </summary>
+        /// <returns></returns>
+       public virtual GrabHandler GetPrimaryGrabber(Hand hand)
+        {
+            if (heldByGrabbers != null)
+            {
+                foreach (var grabber in heldByGrabbers)
+                {
+                    if (grabber != null && grabber._chosenGrab == this)
+                    {
+                        return grabber;
+                    }
+                }
+            }
+
+            return null;
+        }
+        
+
+        /// <summary>
+        /// Método que se ejecuta cuando el objeto comienza a ser agarrado.
+        /// Este método puede ser sobrescrito en clases derivadas.
+        /// </summary>
+        /// <param name="hand">La mano que realiza el agarre.</param>
+       public virtual void OnGrab(GrabHandler grabHandler)
+        {
+            if (grabHandler == null)
+            {
+                Debug.LogWarning("GrabHandler no proporcionado.");
+                return;
+            }
+
+            Hand hand = grabHandler._hand; // Obtenemos la mano desde el GrabHandler
+            hand.CurrentGrab = this;
+
+            if (!heldByGrabbers.Contains(grabHandler))
+            {
+                heldByGrabbers.Add(grabHandler);
+            }
+
+            if (!grabbingHandlers.Contains(grabHandler))
+            {
+                grabbingHandlers.Add(grabHandler);
+                Debug.Log($"Agregado {grabHandler.name} a grabbingHandlers.");
+            }
+
+
+            // Encuentra y ocupa un GrabPoint válido
+            GrabPoint chosenGrabPoint = GetClosestGrabPoint(grabHandler)?.GetComponent<GrabPoint>();
+            if (chosenGrabPoint != null)
+            {
+                chosenGrabPoint.Occupy(hand);
+                hand.CurrentGrabPoint = chosenGrabPoint;
+
+                // Deshabilitar los GrabPoints relacionados
+                foreach (GrabPoint relatedGrabPoint in chosenGrabPoint.DisableGrabPoint ?? new GrabPoint[0])
+                {
+                    relatedGrabPoint.enabled = false;
+                }
+            }
+
+            // Configurar alineación, pose y Join según el tipo de agarre
+            if (GrabMechanic == HandType.Slider)
+            {
+                //StartCoroutine(AlignHandToGrabPointSmooth(grabHandler));
+                StartCoroutine(AlignHandToGrabPoint(grabHandler));
+            }
+            else
+            {
+                StartCoroutine(AlignHandToGrabPoint(grabHandler));
+            }
+
+            AttachHandToGrabPoint(hand);
+            grabHandler.ApplyGrabPose(HandPose);
+            AlignHand(hand);
+
+            IgnoreCollision(hand, true);
+
+             foreach (Grab grab in EnableGrabs)
+            {
+                if (grab)
+                    grab.enabled = true;
+            }
+            foreach (Grab grab in DisableGrabs)
+            {
+                if (grab)
+                    grab.enabled = false;
+            }
+
+            GetComponent<Interactable>()?.OnGrab();
+
+            Debug.Log($"{gameObject.name} ha sido agarrado por {grabHandler.name}.");
+        }
+
+
+         public virtual void IgnoreCollision(Hand hand, bool ignore)
+        {
+            foreach (Collider collider in _body.GetComponentsInChildren<Collider>())
+            {
+                Physics.IgnoreCollision(collider, hand.PhysicsHandCollider, ignore);
+            }
+        }
+
+        
+
+    public void CreateGrabJoint(GrabHandler grabHandler, HandType grabMechanic)
+    {
+         if (grabHandler == null)
+    {
+        Debug.LogWarning("El GrabHandler es nulo.");
+        return;
+    }
+
+    // Si ya está registrado, primero liberar
+    if (grabbingHandlers.Contains(grabHandler))
+    {
+        Debug.LogWarning($"{grabHandler.name} ya está registrado, liberando antes de continuar.");
+        OnRelease(grabHandler, false); // Asegura la liberación antes de un nuevo agarre
+    }
+
+        // Crear un ConfigurableJoint
+        ConfigurableJoint joint = grabHandler._hand.PhysicsHandTransform.gameObject.AddComponent<ConfigurableJoint>();
+
+        // Configurar el cuerpo conectado
+        if (_rigidBody != null)
+            joint.connectedBody = _rigidBody;
+
+          // Configurar restricciones basadas en el GrabMechanic
+        if (grabMechanic == HandType.Slider)
+        {
+            joint.autoConfigureConnectedAnchor = false;
+            joint.anchor = Vector3.zero;
+            joint.connectedAnchor = _body.InverseTransformPoint(primaryGrabOffset.position);
+            //joint.connectedAnchor = _body.InverseTransformPoint(primaryGrabOffset.position);
+
+            // Permitir movimiento solo en el eje Z
+            joint.xMotion = ConfigurableJointMotion.Locked;
+            joint.yMotion = ConfigurableJointMotion.Locked;
+            joint.zMotion = ConfigurableJointMotion.Limited;
+            joint.angularXMotion = ConfigurableJointMotion.Locked;
+            joint.angularYMotion = ConfigurableJointMotion.Locked;
+            joint.angularZMotion = ConfigurableJointMotion.Locked;
+
+            // Configurar límites en el eje Z
+            SoftJointLimit zLimit = new SoftJointLimit
+            {
+                limit = 0.1f // Ajusta según el rango de movimiento permitido
+            };
+            joint.linearLimit = zLimit;
+
+            joint.angularXDrive = new JointDrive
+            {
+                positionSpring = 1000f,
+                positionDamper = 100f,
+                maximumForce = Mathf.Infinity
+            };
+            joint.angularYZDrive = joint.angularXDrive;
+            joint.slerpDrive = joint.angularXDrive;
+
+            // Bloquear todas las rotaciones
+            joint.angularXMotion = ConfigurableJointMotion.Locked;
+            joint.angularYMotion = ConfigurableJointMotion.Locked;
+            joint.angularZMotion = ConfigurableJointMotion.Locked;
+        }
+        else if (grabMechanic == HandType.Grip)
+        {
+            joint.autoConfigureConnectedAnchor = false;
+
+            // Bloquear todos los movimientos y rotaciones
+            joint.xMotion = ConfigurableJointMotion.Locked;
+            joint.yMotion = ConfigurableJointMotion.Locked;
+            joint.zMotion = ConfigurableJointMotion.Locked;
+            joint.angularXMotion = ConfigurableJointMotion.Locked;
+            joint.angularYMotion = ConfigurableJointMotion.Locked;
+            joint.angularZMotion = ConfigurableJointMotion.Locked;
+
+            // Ajustar el offset del punto de agarre
+            joint.anchor = Vector3.zero;
+            joint.connectedAnchor = _body.InverseTransformPoint(primaryGrabOffset.position);
+        }
+
+        // Registrar el handler y el joint
+        grabbingHandlers.Add(grabHandler);
+        handlerJoints[grabHandler] = joint;
+        handlerTypes[grabHandler] = grabMechanic;
+
+        Debug.Log($"Joint creado para {grabMechanic}. Offset: {primaryGrabOffset.position}");
+    }
+
+
+
+
+        /// <summary>
+        /// Método que se ejecuta cuando el objeto deja de ser agarrado.
+        /// Este método puede ser sobrescrito en clases derivadas.
+        /// </summary>
+        /// <param name="hand">La mano que suelta el objeto.</param>
+        /// <param name="toggleGrabs">Indica si se deben habilitar o deshabilitar otros GrabPoints asociados.</param>
+        public virtual void OnRelease(GrabHandler grabHandler, bool toggleGrabs)
+{
+    if (grabHandler == null)
+        return;
+
+    // Eliminar el joint asociado
+    if (handlerJoints.TryGetValue(grabHandler, out ConfigurableJoint joint))
+    {
+        Destroy(joint);
+        handlerJoints.Remove(grabHandler);
+        Debug.Log($"Joint eliminado para {grabHandler.name}");
+    }
+
+    // Eliminar el GrabHandler de las listas
+    if (grabbingHandlers.Contains(grabHandler))
+    {
+        grabbingHandlers.Remove(grabHandler);
+        Debug.Log($"GrabHandler {grabHandler.name} eliminado de grabbingHandlers.");
+    }
+
+    handlerTypes.Remove(grabHandler);
+
+    // Liberar el GrabPoint asociado
+    GrabPoint occupiedGrabPoint = grabHandler._hand.CurrentGrabPoint;
+    if (occupiedGrabPoint != null)
+    {
+        occupiedGrabPoint.Release();
+        Debug.Log($"GrabPoint {occupiedGrabPoint.name} liberado por {grabHandler.name}.");
+    }
+
+    // Restaurar la mano
+    grabHandler._hand.CurrentGrab = null;
+    grabHandler._hand.CurrentGrabPoint = null;
+
+    
+            PhysicsHand physicsHand = grabHandler._hand.GetComponent<PhysicsHand>();
+            if (physicsHand != null)
+            {
+                physicsHand.ResetOffsets();
+            }
+
+            DetachHandFromGrabPoint(grabHandler);
+
+    if (toggleGrabs)
+    {
+        foreach (Grab grab in EnableGrabs)
+        {
+            if (grab)
+                grab.enabled = false;
+        }
+        foreach (Grab grab in DisableGrabs)
+        {
+            if (grab)
+                grab.enabled = true;
+        }
+    }
+
+       // Restaurar la rotación inicial de la mano
+            grabHandler._hand.PalmTransform.rotation = grabHandler._hand.PhysicsHandTransform.rotation;          
+
+            GetComponent<Interactable>()?.OnRelease();
+
+    Debug.Log($"{gameObject.name} ha sido soltado por {grabHandler.name}.");
+}
+
+
+         public virtual void DestroyGrabJoint(Hand hand)
+        {
+            if (hand == null)
+                return;
+                 FixedJoint grabJoint = hand.PhysicsHandTransform.GetComponent<FixedJoint>();
+
+            if (GrabMechanic == HandType.Slider) {               
+                grabJoint.anchor = Vector3.zero;  
+            }
+
+            Destroy(grabJoint);           
+
+            IgnoreCollision(hand, false);
+        }
+
+       
+
+      private void OnDisable()
+{
+    // Liberar cada GrabHandler
+    foreach (GrabHandler grabHandler in grabbingHandlers.ToArray()) // Usar una copia para evitar modificaciones concurrentes
+    {
+        OnRelease(grabHandler, false);
+    }
+
+    // Limpieza final de listas y referencias
+    grabbingHandlers.Clear();
+    handlerJoints.Clear();
+    handlerTypes.Clear();
+    heldByGrabbers.Clear();
+    LeftHand = null;
+    RightHand = null;
+
+    Debug.Log("Todos los handlers y joints han sido liberados al deshabilitar el objeto.");
+}
+
+
+       private void AttachHandToGrabPoint(Hand hand)
+        {
+            hand.transform.SetParent(primaryGrabOffset); // Asignar al grab point
+            hand.transform.localPosition = Vector3.zero; // Sin offset de posición
+            hand.transform.localRotation = Quaternion.identity; // Sin offset de rotación
+        }
+
+        private IEnumerator AlignHandToGrabPoint(GrabHandler hand)
+        {
+            // Alineación suave antes de fijar la posición
+            float duration = 0.1f; // Duración de la interpolación
+            float elapsed = 0f;
+
+            Vector3 startPosition = hand.transform.position;
+            Quaternion startRotation = hand.transform.rotation;
+
+            Vector3 targetPosition = primaryGrabOffset.position;
+            Quaternion targetRotation = primaryGrabOffset.rotation;
+
+            while (elapsed < duration)
+            {
+                elapsed += Time.deltaTime;
+                float t = elapsed / duration;
+
+                hand.transform.position = Vector3.Lerp(startPosition, targetPosition, t);
+                hand.transform.rotation = Quaternion.Slerp(startRotation, targetRotation, t);
+
+                yield return null;
+            }
+
+            // Asegurar alineación final
+            hand.transform.position = targetPosition;
+            hand.transform.rotation = targetRotation;
+            CreateGrabJoint(hand, HandType.Grip); // Para el grip
+
+          
+        }
+        private IEnumerator AlignHandToGrabPointSmooth(GrabHandler hand)
+        {
+            Transform grabPoint = primaryGrabOffset; // Obtén el punto de agarre correspondiente
+            float duration = 0.2f; // Tiempo para completar la alineación
+            float elapsedTime = 0f;
+
+            Vector3 startPosition = hand._hand.PalmTransform.position;
+            Quaternion startRotation = hand._hand.PalmTransform.rotation;
+
+            while (elapsedTime < duration)
+            {
+                elapsedTime += Time.deltaTime;
+                float t = elapsedTime / duration;
+
+                // Movimiento y rotación suaves hacia el punto de agarre
+                hand._hand.PalmTransform.position = Vector3.Lerp(startPosition, grabPoint.position, t);
+
+                // Mantener la rotación restringida al eje Y y Z
+                Quaternion targetRotation = grabPoint.rotation;
+                targetRotation = Quaternion.Euler(
+                    startRotation.eulerAngles.x, // Mantén el eje X original
+                    targetRotation.eulerAngles.y,
+                    targetRotation.eulerAngles.z
+                );
+
+                hand._hand.PalmTransform.rotation = Quaternion.Slerp(startRotation, targetRotation, t);
+
+                yield return null;
+            }
+
+            // Asegura que la mano esté exactamente en el punto final
+            hand._hand.PalmTransform.position = grabPoint.position;
+            hand._hand.PalmTransform.rotation = grabPoint.rotation;
+
+            CreateGrabJoint(hand, HandType.Slider); // Para el slider
+        }
+
+
+
+        private void DetachHandFromGrabPoint(GrabHandler hand)
+        {
+            hand.transform.SetParent(null);
+        }
+
+        public virtual void CreateCollider()
+        {
+            SphereCollider collider = gameObject.AddComponent<SphereCollider>();
+            collider.isTrigger = true;
+            collider.radius = 0.01f;
+            Collider = collider;
+        }
+      
+          private void CreateGrabPoint()
+        {
+            if (primaryGrabOffset == null)
+            {
+                primaryGrabOffset = new GameObject("Primary Grab Point").transform;
+                primaryGrabOffset.SetParent(this.transform);
+                primaryGrabOffset.localPosition = Vector3.zero;
+            }
+
+        }
+
+       private void AlignObjectToHand(Hand hand)
+        {
+            if (primaryGrabOffset != null)
+            {
+                // Mover el objeto para alinear su posición con la mano
+                transform.position = hand.PhysicsHandTransform.position;
+
+                // Ajustar la rotación del objeto para que coincida con la mano
+                transform.rotation = hand.PhysicsHandTransform.rotation * Quaternion.Inverse(primaryGrabOffset.localRotation);
+            }
+        }
+
+
+
+        /// <summary>
+        /// Visualiza los puntos de agarre en el editor para facilitar ajustes.
+        /// </summary>
+        private void OnDrawGizmosSelected()
+        {
+            Gizmos.color = Color.green;
+
+            foreach (Transform grabPoint in grabPoints)
+            {
+                if (grabPoint != null)
+                {
+                    Gizmos.DrawWireSphere(grabPoint.position, 0.01f);
+                }
+            }
+
+             Gizmos.color = Color.red;
+
+            // Dibuja una esfera en la posición de primaryGrabOffset si existe
+            if (primaryGrabOffset != null)
+            {
+                Gizmos.DrawWireSphere(primaryGrabOffset.position, 0.02f);
+
+                // También puedes dibujar una línea desde el objeto al primaryGrabOffset para mayor claridad
+                Gizmos.DrawLine(transform.position, primaryGrabOffset.position);
+
+                // Opcional: Añadir un label (requiere usar Handles)
+                #if UNITY_EDITOR
+                UnityEditor.Handles.Label(primaryGrabOffset.position, "Primary Grab Offset");
+               
+                #endif
+            }          
+        }
+    }
+}
+public enum HandType
+{
+    Grip,
+    Slider
+}
